@@ -112,15 +112,48 @@ or `nil` otherwise.
 
 ### <a name="config-ebs_volume_size"></a> ebs\_volume\_size
 
-**Required** Size of ebs volume in GB.
+**Deprecated** See [block_device_mappings](#config-block_device_mappings) below.
+
+Size of ebs volume in GB.
 
 ### <a name="config-ebs_delete_on_termination"></a> ebs\_delete\_on\_termination
 
-**Required** `true` if you want ebs volumes to get deleted automatically after instance is terminated, `false` otherwise
+**Deprecated** See [block_device_mappings](#config-block_device_mappings) below.
+
+`true` if you want ebs volumes to get deleted automatically after instance is terminated, `false` otherwise
 
 ### <a name="config-ebs_device_name"></a> ebs\_device\_name
 
-**Required** name of your ebs device, for example: `/dev/sda`
+**Deprecated** See [block_device_mappings](#config-block_device_mappings) below.
+
+name of your ebs device, for example: `/dev/sda1`
+
+### <a name="config-block_device_mappings"></a> block\_device\_mappings
+
+**Required** A list of block device mappings for the machine.  An example of all available keys looks like:
+```yaml
+block_device_mappings:
+  - ebs_device_name: /dev/sda1
+    ebs_volume_size: 20
+    ebs_delete_on_termination: true
+  - ebs_device_name: /dev/sda2
+    ebs_volume_type: gp2
+    ebs_virtual_name: test
+    ebs_volume_size: 15
+    ebs_delete_on_termination: true
+    ebs_snapshot_id: snap-0015d0bc
+```
+
+The keys `ebs_device_name`, `ebs_volume_size` and `ebs_delete_on_termination` are required for every mapping.
+For backwards compatiability a default `block_device_mappings` will be created if none are listed and the deprecated
+storage config keys are present.
+
+The keys `ebs_volume_type`, `ebs_virtual_name` and `ebs_snapshot_id` are optional.  See
+[Amazon EBS Volume Types](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSVolumeTypes.html) to find out more about
+volume types. `ebs_volume_type` defaults to `standard` but can also be `gp2` or `io1`.
+
+If you have a block device mapping with a `ebs_device_name` equal to the root storage device name on your
+[image](#config-image-id) then the provided mapping will replace the settings in the image.
 
 ### endpoint
 
@@ -203,6 +236,12 @@ The EC2 [subnet][subnet_docs] to use.
 
 The default is unset, or `nil`.
 
+### <a name="config-private-ip-address"></a> private\_ip\_address
+
+The primary private IP address of your instance. 
+
+If you don't set this it will default to whatever DHCP address EC2 hands out.
+
 ### <a name="config-tags"></a> tags
 
 The Hash of EC tag name/value pairs which will be applied to the instance.
@@ -260,8 +299,9 @@ driver:
   ssh_timeout: 10
   ssh_retries: 5
   ebs_volume_size: 6,
-  ebs_delete_on_termination: 'true'
-  ebs_device_name: '/dev/sda'
+  ebs_delete_on_termination: true
+  ebs_device_name: '/dev/sda1'
+  flavor_id: t2.micro
 
 platforms:
   - name: ubuntu-12.04

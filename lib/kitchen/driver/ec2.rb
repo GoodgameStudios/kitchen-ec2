@@ -29,7 +29,7 @@ module Kitchen
     #
     # @author Fletcher Nichol <fnichol@nichol.ca>
     class Ec2 < Kitchen::Driver::SSHBase
-
+      include Fog::AWS::CredentialFetcher::ServiceMethods
       default_config :region,             'us-east-1'
       default_config :availability_zone,  'us-east-1b'
       default_config :flavor_id,          'm1.small'
@@ -37,16 +37,20 @@ module Kitchen
       default_config :security_group_ids, ['default']
       default_config :tags,               { 'created-by' => 'test-kitchen' }
       default_config :user_data,          nil
+      default_config :private_ip_address, nil
       default_config :iam_profile_name,   nil
-      default_config :price,   nil
+      default_config :price,              nil
+      default_config :options,            {}
       default_config :aws_access_key_id do |driver|
-        ENV['AWS_ACCESS_KEY'] || ENV['AWS_ACCESS_KEY_ID']
+        ENV['AWS_ACCESS_KEY'] || ENV['AWS_ACCESS_KEY_ID'] ||
+          driver.iam_creds[:aws_access_key_id]
       end
       default_config :aws_secret_access_key do |driver|
-        ENV['AWS_SECRET_KEY'] || ENV['AWS_SECRET_ACCESS_KEY']
+        ENV['AWS_SECRET_KEY'] || ENV['AWS_SECRET_ACCESS_KEY'] ||
+          driver.iam_creds[:aws_secret_access_key]
       end
       default_config :aws_session_token do |driver|
-        ENV['AWS_SESSION_TOKEN'] || ENV['AWS_TOKEN']
+        driver.default_aws_session_token
       end
       default_config :aws_ssh_key_id do |driver|
         ENV['AWS_SSH_KEY_ID']
@@ -73,14 +77,54 @@ module Kitchen
       required_config :aws_ssh_key_id
       required_config :image_id
 
+      # TODO: remove these in the next major version of TK
+      deprecated_configs = [:ebs_volume_size, :ebs_delete_on_termination, :ebs_device_name]
+      deprecated_configs.each do |d|
+        validations[d] = lambda do |attr, val, driver|
+          unless val.nil?
+            driver.warn "WARN: The config key `#{attr}` is deprecated," +
+              ' please use `block_device_mappings`'
+          end
+        end
+      end
+
+      default_config :block_device_mappings, []
+      validations[:block_device_mappings] = lambda do |attr, val, driver|
+        val.each do |bdm|
+          unless bdm.keys.include?(:ebs_volume_size) &&
+            bdm.keys.include?(:ebs_delete_on_termination) &&
+            bdm.keys.include?(:ebs_device_name)
+            raise 'Every :block_device_mapping must include the keys :ebs_volume_size, ' +
+              ':ebs_delete_on_termination and :ebs_device_name'
+          end
+        end
+      end
+
+      # First we check the existence of the metadata host.  Only fetch_credentials
+      # if we can find the host.
+      def iam_creds
+        require 'net/http'
+        require 'timeout'
+        @iam_creds ||= begin
+          timeout(5) do
+            Net::HTTP.get(URI.parse('http://169.254.169.254'))
+          end
+          fetch_credentials(use_iam_profile: true)
+        rescue Errno::EHOSTUNREACH, Errno::EHOSTDOWN, Timeout::Error,
+          NoMethodError, ::StandardError => e
+          debug("fetch_credentials failed with exception #{e.message}:#{e.backtrace.join("\n")}")
+          {}
+        end
+      end
+
       def create(state)
         return if state[:server_id]
 
         info("Creating <#{state[:server_id]}>...")
-        info("If you are not using an account that qualifies under the AWS")
-        info("free-tier, you may be charged to run these suites. The charge")
-        info("should be minimal, but neither Test Kitchen nor its maintainers")
-        info("are responsible for your incurred costs.")
+        info('If you are not using an account that qualifies under the AWS')
+        info('free-tier, you may be charged to run these suites. The charge')
+        info('should be minimal, but neither Test Kitchen nor its maintainers')
+        info('are responsible for your incurred costs.')
 
         if config[:price]
           # Spot instance when a price is set
@@ -95,7 +139,8 @@ module Kitchen
         server.wait_for do
           print '.'
           # Euca instances often report ready before they have an IP
-          ready? && !public_ip_address.nil? && public_ip_address != '0.0.0.0'
+          hostname = Kitchen::Driver::Ec2.hostname(self)
+          ready? && !hostname.nil? && hostname != '0.0.0.0'
         end
         print '(server ready)'
         state[:hostname] = hostname(server)
@@ -132,6 +177,24 @@ module Kitchen
         !!config[:subnet_id]
       end
 
+      # If running on an EC2 node there are 3 possible scenarios:
+      #  1) The user has supplied the session token as an environment variable
+      #  2) The user has manually set access key/secret - don't use the session token from
+      #    the metadata service, only auth with key/secret supplied
+      #  3) The user has not set the access key/secret - because we default these values
+      #    we cannot tell if these have not been set.  So we do our best guess by checking
+      #    if the current value is the same as what is returned from the metadata service.
+      #    If they are the same we assume no user values have been set and we use the
+      #    metadata service values.
+      def default_aws_session_token
+        env = ENV['AWS_SESSION_TOKEN'] || ENV['AWS_TOKEN']
+        if config[:aws_secret_access_key] == iam_creds[:aws_secret_access_key] &&
+          config[:aws_access_key_id] == iam_creds[:aws_access_key_id]
+          env ||= iam_creds[:aws_session_token]
+        end
+        env
+      end
+
       private
 
       def connection
@@ -155,6 +218,7 @@ module Kitchen
           :flavor_id                 => config[:flavor_id],
           :ebs_optimized             => config[:ebs_optimized],
           :image_id                  => config[:image_id],
+          :private_ip_address        => config[:private_ip_address],
           :key_name                  => config[:aws_ssh_key_id],
           :subnet_id                 => config[:subnet_id],
           :iam_instance_profile_name => config[:iam_profile_name],
@@ -164,11 +228,8 @@ module Kitchen
               File.read(config[:user_data]) : config[:user_data]
             )
           ),
-          :block_device_mapping      => [{
-            'Ebs.VolumeSize' => config[:ebs_volume_size],
-            'Ebs.DeleteOnTermination' => config[:ebs_delete_on_termination],
-            'DeviceName' => config[:ebs_device_name]
-          }]
+          :block_device_mapping      => block_device_mappings,
+          :options                   => config[:options]
         )
       end
 
@@ -177,11 +238,12 @@ module Kitchen
 
         connection.spot_requests.create(
           :availability_zone         => config[:availability_zone],
-          :security_group_ids        => config[:security_group_ids],
+          :groups                    => config[:security_group_ids],
           :tags                      => config[:tags],
           :flavor_id                 => config[:flavor_id],
           :ebs_optimized             => config[:ebs_optimized],
           :image_id                  => config[:image_id],
+          :private_ip_address        => config[:private_ip_address],
           :key_name                  => config[:aws_ssh_key_id],
           :subnet_id                 => config[:subnet_id],
           :iam_instance_profile_name => config[:iam_profile_name],
@@ -191,7 +253,8 @@ module Kitchen
             )
           ),
           :price                     => config[:price],
-          :instance_count            => config[:instance_count]
+          :instance_count            => config[:instance_count],
+          :options                   => config[:options]
         )
       end
 
@@ -201,6 +264,7 @@ module Kitchen
         debug("ec2:flavor_id '#{config[:flavor_id]}'")
         debug("ec2:ebs_optimized '#{config[:ebs_optimized]}'")
         debug("ec2:image_id '#{config[:image_id]}'")
+        debug("ec2:private_ip_address '#{config[:private_ip_address]}'")
         debug("ec2:security_group_ids '#{config[:security_group_ids]}'")
         debug("ec2:tags '#{config[:tags]}'")
         debug("ec2:key_name '#{config[:aws_ssh_key_id]}'")
@@ -221,22 +285,41 @@ module Kitchen
         end
       end
 
-      def interface_types
+      #
+      # Ordered mapping from config name to Fog name.  Ordered by preference
+      # when looking up hostname.
+      #
+      INTERFACE_TYPES =
         {
           'dns' => 'dns_name',
           'public' => 'public_ip_address',
           'private' => 'private_ip_address'
         }
+
+      #
+      # Lookup hostname of a provided server using the configured interface.
+      #
+      def hostname(server)
+        Kitchen::Driver::Ec2.hostname(server, config[:interface])
       end
 
-      def hostname(server)
-        if config[:interface]
-          method = interface_types.fetch(config[:interface]) do
-            raise Kitchen::UserError, 'Invalid interface'
+      #
+      # Lookup hostname of provided server.  If interface_type is provided use
+      # that interface to lookup hostname.  Otherwise, try ordered list of
+      # options.
+      #
+      def self.hostname(server, interface_type=nil)
+        if interface_type
+          interface_type = INTERFACE_TYPES.fetch(interface_type) do
+            raise Kitchen::UserError, "Invalid interface [#{interface_type}]"
           end
-          server.send(method)
+          server.send(interface_type)
         else
-          server.dns_name || server.public_ip_address || server.private_ip_address
+          potential_hostname = nil
+          INTERFACE_TYPES.values.each do |type|
+            potential_hostname ||= server.send(type)
+          end
+          potential_hostname
         end
       end
 
@@ -255,6 +338,52 @@ module Kitchen
           )
         end
         connection.servers.get(spot.instance_id)
+      end
+
+      # A mapping from config key values to what Fog expects
+      CONFIG_TO_AWS = {
+        :ebs_volume_size => 'Ebs.VolumeSize',
+        :ebs_volume_type => 'Ebs.VolumeType',
+        :ebs_delete_on_termination => 'Ebs.DeleteOnTermination',
+        :ebs_snapshot_id => 'Ebs.SnapshotId',
+        :ebs_device_name => 'DeviceName',
+        :ebs_virtual_name => 'VirtualName'
+      }
+
+      def block_device_mappings
+        bdms = config[:block_device_mappings]
+
+        # If they don't provide one, lets give them a default one
+        if bdms.nil? || bdms.empty?
+          bdms = [{
+            :ebs_volume_type => 'standard',
+            :ebs_volume_size => config[:ebs_volume_size],
+            :ebs_delete_on_termination => config[:ebs_delete_on_termination],
+            :ebs_snapshot_id => nil,
+            :ebs_device_name => config[:ebs_device_name],
+            :ebs_virtual_name => nil
+          }]
+        end
+
+        # This could be helpful for users debugging
+        image_id = config[:image_id]
+        image = connection.images.get(image_id)
+        if image.nil?
+          raise "Could not find image [#{image_id}]"
+        end
+        root_device_name = image.root_device_name
+        bdms.find { |bdm|
+          if bdm[:ebs_device_name] == root_device_name
+            info("Overriding root device [#{root_device_name}] from image [#{image_id}]")
+          end
+        }
+
+        # Convert the provided keys to what Fog expects
+        bdms = bdms.map do |bdm|
+          Hash[bdm.map { |k, v| [CONFIG_TO_AWS[k], v] }]
+        end
+
+        bdms
       end
     end
   end
